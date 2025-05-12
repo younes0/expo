@@ -1,4 +1,5 @@
 import { useMemo } from 'react';
+import Hls from 'hls.js';
 
 import type {
   BufferOptions,
@@ -41,6 +42,12 @@ export function getSourceUri(source: VideoSource): string | null {
   return source?.uri ?? null;
 }
 
+// Helper function to check if a URL is an HLS stream
+export function isHlsSource(url: string | null): boolean {
+  if (!url) return false;
+  return url.indexOf('.m3u8') > -1;
+}
+
 export function createVideoPlayer(source: VideoSource): VideoPlayer {
   const parsedSource = typeof source === 'string' ? { uri: source } : source;
 
@@ -60,6 +67,7 @@ export default class VideoPlayerWeb
   previousSrc: VideoSource = null;
   _mountedVideos: Set<HTMLVideoElement> = new Set();
   _audioNodes: Set<MediaElementAudioSourceNode> = new Set();
+  _hlsInstances: Map<HTMLVideoElement, Hls> = new Map(); // Track HLS instances for each video
   playing: boolean = false;
   _muted: boolean = false;
   _volume: number = 1;
@@ -182,7 +190,7 @@ export default class VideoPlayerWeb
           currentOffsetFromLive: null,
           bufferedPosition: this.bufferedPosition,
         });
-      }, value * 1000);
+      }, value * 1000) as unknown as number;
     }
   }
 
@@ -234,10 +242,76 @@ export default class VideoPlayerWeb
     this._mountedVideos.add(video);
     this._addListeners(video);
     this._synchronizeWithFirstVideo(video);
+
+    // Set up HLS if needed
+    const sourceUri = getSourceUri(this.src);
+    this._setupHlsIfNeeded(video, sourceUri);
   }
 
   unmountVideoView(video: HTMLVideoElement) {
+    // Clean up HLS instance if exists
+    const hlsInstance = this._hlsInstances.get(video);
+    if (hlsInstance) {
+      hlsInstance.destroy();
+      this._hlsInstances.delete(video);
+    }
+
     this._mountedVideos.delete(video);
+  }
+
+  _setupHlsIfNeeded(video: HTMLVideoElement, sourceUri: string | null) {
+    // Clean up any existing HLS instance for this video
+    const existingHls = this._hlsInstances.get(video);
+    if (existingHls) {
+      existingHls.destroy();
+      this._hlsInstances.delete(video);
+    }
+
+    if (!sourceUri || !isHlsSource(sourceUri)) return;
+
+    // Skip HLS setup if browser supports HLS natively
+    if (video.canPlayType('application/vnd.apple.mpegurl')) return;
+
+    // Only set up HLS.js if supported and needed
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+        debug: false,
+        enableWorker: true,
+        lowLatencyMode: true,
+      });
+
+      hls.loadSource(sourceUri);
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        if (this.playing) {
+          video.play();
+        }
+      });
+
+      hls.on(Hls.Events.ERROR, (event, data) => {
+        if (data.fatal) {
+          switch (data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR:
+              hls.startLoad();
+              break;
+            case Hls.ErrorTypes.MEDIA_ERROR:
+              hls.recoverMediaError();
+              break;
+            default:
+              this._error = {
+                message: `HLS error: ${data.details}`,
+              };
+              this.status = 'error';
+              hls.destroy();
+              this._hlsInstances.delete(video);
+              break;
+          }
+        }
+      });
+
+      this._hlsInstances.set(video, hls);
+    }
   }
 
   mountAudioNode(
@@ -287,22 +361,40 @@ export default class VideoPlayerWeb
   }
 
   replace(source: VideoSource): void {
+    const uri = getSourceUri(source);
+
     this._mountedVideos.forEach((video) => {
-      const uri = getSourceUri(source);
       video.pause();
-      if (uri) {
+
+      // For HLS streams, handle with hls.js if needed
+      if (uri && isHlsSource(uri)) {
+        // For browsers that don't support HLS natively
+        if (!video.canPlayType('application/vnd.apple.mpegurl') && Hls.isSupported()) {
+          this._setupHlsIfNeeded(video, uri);
+        } else {
+          // For browsers with native HLS support like Safari
+          video.setAttribute('src', uri);
+          video.load();
+        }
+      } else if (uri) {
+        // For non-HLS streams
         video.setAttribute('src', uri);
         video.load();
-        video.play();
       } else {
+        // For null sources
         video.removeAttribute('src');
         video.load();
       }
+
+      // Start playing if needed
+      if (this.playing) {
+        video.play();
+      }
     });
     // TODO @behenate: this won't work when we add support for playlists
+
     this.previousSrc = this.src;
     this.src = source;
-    this.playing = true;
   }
 
   // The HTML5 player already offloads loading of the asset onto a different thread so we can keep the same

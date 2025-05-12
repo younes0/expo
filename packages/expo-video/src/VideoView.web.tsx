@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, forwardRef, useImperativeHandle } from 'react';
 import { StyleSheet } from 'react-native';
+import Hls from 'hls.js';
 
-import VideoPlayer, { getSourceUri } from './VideoPlayer.web';
+import VideoPlayer, { getSourceUri, isHlsSource } from './VideoPlayer.web';
 import type { VideoViewProps } from './VideoView.types';
 
 function createAudioContext(): AudioContext | null {
@@ -30,6 +31,7 @@ export function isPictureInPictureSupported(): boolean {
 
 export const VideoView = forwardRef((props: { player?: VideoPlayer } & VideoViewProps, ref) => {
   const videoRef = useRef<null | HTMLVideoElement>(null);
+  const hlsRef = useRef<Hls | null>(null); // Reference for HLS instance
   const mediaNodeRef = useRef<null | MediaElementAudioSourceNode>(null);
   const hasToSetupAudioContext = useRef(false);
   const fullscreenChangeListener = useRef<null | (() => void)>(null);
@@ -98,6 +100,72 @@ export const VideoView = forwardRef((props: { player?: VideoPlayer } & VideoView
       videoRef.current?.removeEventListener('loadeddata', onCanPlay);
     };
   }, [videoRef, props.onPictureInPictureStop, props.onPictureInPictureStart]);
+
+  // Set up HLS.js when src changes
+  useEffect(() => {
+    const src = getSourceUri(props.player?.src);
+
+    // Clean up any existing HLS instance
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
+    }
+
+    if (!videoRef.current || !src) return;
+
+    // If it's an HLS source and browser doesn't support HLS natively
+    if (isHlsSource(src) && Hls.isSupported()) {
+      // Native support check (Safari has native HLS support)
+      if (!videoRef.current.canPlayType('application/vnd.apple.mpegurl')) {
+        const hls = new Hls({
+          debug: false,
+          enableWorker: true,
+          lowLatencyMode: true,
+        });
+
+        hls.loadSource(src);
+        hls.attachMedia(videoRef.current);
+
+        hls.on(Hls.Events.MEDIA_ATTACHED, function () {
+          console.log('HLS media attached');
+        });
+
+        hls.on(Hls.Events.MANIFEST_PARSED, function () {
+          if (props.player?.playing) {
+            videoRef.current?.play();
+          }
+        });
+
+        hls.on(Hls.Events.ERROR, function (event, data) {
+          if (data.fatal) {
+            switch (data.type) {
+              case Hls.ErrorTypes.NETWORK_ERROR:
+                console.log('Network error, trying to recover...');
+                hls.startLoad();
+                break;
+              case Hls.ErrorTypes.MEDIA_ERROR:
+                console.log('Media error, trying to recover...');
+                hls.recoverMediaError();
+                break;
+              default:
+                console.error('Unrecoverable HLS error:', data);
+                hls.destroy();
+                break;
+            }
+          }
+        });
+
+        hlsRef.current = hls;
+      }
+    }
+
+    return () => {
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+    };
+  }, [props.player?.src]);
 
   // Adds the video view as a candidate for being the audio source for the player (when multiple views play from one
   // player only one will emit audio).
@@ -176,6 +244,12 @@ export const VideoView = forwardRef((props: { player?: VideoPlayer } & VideoView
       }
       cleanupFullscreenListener();
       detachAudioNodes();
+
+      // Clean up HLS
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
     };
   }, [props.player]);
 
@@ -202,11 +276,21 @@ export const VideoView = forwardRef((props: { player?: VideoPlayer } & VideoView
           videoRef.current = newRef;
           hasToSetupAudioContext.current = true;
           maybeSetupAudioContext();
+
+          // Reattach HLS if needed when video element changes
+          const src = getSourceUri(props.player?.src);
+          if (hlsRef.current && isHlsSource(src)) {
+            hlsRef.current.attachMedia(newRef);
+          }
         }
       }}
       disablePictureInPicture={!props.allowsPictureInPicture}
       playsInline={props.playsInline}
-      src={getSourceUri(props.player?.src) ?? ''}
+      src={
+        !isHlsSource(getSourceUri(props.player?.src)) || !Hls.isSupported()
+          ? (getSourceUri(props.player?.src) ?? '')
+          : undefined
+      }
     />
   );
 });
